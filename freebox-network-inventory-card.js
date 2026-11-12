@@ -1,9 +1,9 @@
 /**
- * Freebox Network Inventory Card v2.3.0
+ * Freebox Network Inventory Card
  * Style inspiré de tplink-router-card
  */
 
-const VERSION = '2.12.0';
+const VERSION = '2.13.0';
 const DOMAIN  = 'freebox_network_inventory';
 const PAGE_DEF = 10;
 
@@ -11,7 +11,11 @@ const GLOBAL_KEYS = new Set([
   `sensor.${DOMAIN}_devices_online`,
   `sensor.${DOMAIN}_devices_total`,
   `sensor.${DOMAIN}_devices_new`,
+  `sensor.${DOMAIN}_static_leases`,
 ]);
+const LEASES_EID = `sensor.${DOMAIN}_static_leases`;
+
+const esc = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
 const DEVICE_ICONS = [
   { icon: 'mdi:television',      kw: ['téléviseur','television','tv'] },
@@ -235,6 +239,16 @@ const STYLES = `
   .type-badge.good   { border-color: #2ed47a; color: #1a9e58; background: rgba(46,212,122,.08); }
   .type-badge.neutral{ border-color: var(--divider-color); color: var(--secondary-text-color); background: transparent; }
 
+  /* ── Persistant / bail statique ── */
+  .yes  { color: #1a9e58; font-weight: 700; font-size: 12px; }
+  .ip-cell { display: inline-flex; align-items: center; gap: 4px; }
+  .lease-ico { --mdi-icon-size: 13px; color: var(--primary-color); }
+  .lease-mismatch { color: #e0a000; }
+  .pedit-btn.danger { background: transparent; color: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
+  .pfield > .pedit-input { flex: none; }
+  .pedit-hint { font-size: 11px; color: var(--secondary-text-color); margin-top: 2px; }
+  .pedit-err  { font-size: 11px; color: var(--error-color, #db4437); margin-top: 2px; min-height: 14px; }
+
   /* ── Vendor ── */
   .vendor-text { font-size: 12px; color: var(--secondary-text-color); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -323,7 +337,7 @@ const STYLES = `
   .pfield { display: flex; flex-direction: column; gap: 3px; }
   .pfield .plabel { font-size: 10px; color: var(--secondary-text-color); font-weight: 500; text-transform: uppercase; letter-spacing: .4px; }
   .pfield .pvalue { font-size: 13px; color: var(--primary-text-color); font-family: monospace; word-break: break-all; }
-  .pfield .pvalue.empty { color: var(--disabled-text-color); font-style: italic; font-family: inherit; font-size: 12px; }
+  .pfield .pvalue.empty { color: var(--disabled-text-color); font-style: italic; font-family: inherit; font-size: 12px; padding: 0; text-align: left; }
   .pfield.full { grid-column: 1 / -1; }
   .ip-tag {
     display: inline-block;
@@ -414,6 +428,7 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
           <button class="fbtn" data-f="all">All</button>
           <button class="fbtn" data-f="online">Online</button>
           <button class="fbtn" data-f="offline">Offline</button>
+          <button class="fbtn" data-f="static" title="Static DHCP leases">Static</button>
         </div>
       </div>
       <div class="table-wrap">
@@ -425,6 +440,7 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
             <th data-col="ip">IP <span class="sa">↕</span></th>
             <th data-col="vendor">Vendor <span class="sa">↕</span></th>
             <th data-col="host_type">Type <span class="sa">↕</span></th>
+            <th data-col="persistent" title="Kept in the Freebox inventory even when offline">Persistent <span class="sa">↕</span></th>
             <th data-col="last_seen">Last seen <span class="sa">↕</span></th>
           </tr></thead>
           <tbody id="tbody"></tbody>
@@ -499,6 +515,7 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
       if (GLOBAL_KEYS.has(eid)) continue;
       if (state.state === 'unavailable') continue;
       const a = state.attributes || {};
+      if (!a.mac) continue;   // capteurs switch, etc.
       out.push({
         eid,
         mac:           a.mac || '',
@@ -519,9 +536,30 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
         reachable:     a.reachable,
         active:        a.active,
         persistent:    a.persistent,
+        static_lease:  !!a.static_lease,
+        static_ip:     a.static_ip || '',
+        static_comment:a.static_lease_comment || '',
+      });
+    }
+    // Baux statiques dont la MAC n'est pas (ou plus) dans l'inventaire
+    const known = new Set(out.map(d => d.mac.toUpperCase()));
+    for (const l of this._leases()) {
+      if (known.has((l.mac||'').toUpperCase())) continue;
+      out.push({
+        eid: null, orphan: true,
+        mac: l.mac, name: l.comment || l.hostname || l.mac,
+        ip: l.ip || '', ipv6: '', ip_list: l.ip ? [l.ip] : [], ip_count: l.ip ? 1 : 0,
+        vendor: '', host_type: '', domain: '', ap_mac: '', ap_speed: null,
+        first_seen: '', last_seen: '', last_activity: '',
+        online: false, reachable: false, active: false, persistent: null,
+        static_lease: true, static_ip: l.ip || '', static_comment: l.comment || '',
       });
     }
     return out;
+  }
+
+  _leases() {
+    return this._hass?.states?.[LEASES_EID]?.attributes?.leases || [];
   }
 
   _filtered(all) {
@@ -529,14 +567,16 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
       .filter(d => {
         if (this._filter === 'online'  && !d.online) return false;
         if (this._filter === 'offline' &&  d.online) return false;
+        if (this._filter === 'static'  && !d.static_lease) return false;
         if (this._search) {
           const s = this._search.toLowerCase();
-          return [d.name,d.mac,d.vendor,d.ip,d.host_type,d.domain].some(v=>(v||'').toLowerCase().includes(s));
+          return [d.name,d.mac,d.vendor,d.ip,d.static_ip,d.static_comment,d.host_type,d.domain].some(v=>(v||'').toLowerCase().includes(s));
         }
         return true;
       })
       .sort((a,b) => {
         let av = a[this._sortCol]??'', bv = b[this._sortCol]??'';
+        if (this._sortCol === 'ip') { av = a.ip || a.static_ip || ''; bv = b.ip || b.static_ip || ''; }
         if (typeof av === 'boolean') return av===bv ? 0 : (av ? -this._sortDir : this._sortDir);
         if (this._sortCol === 'ip') {
           const n = ip => { const p=ip.split('.').map(Number); return p.length===4&&p.every(x=>!isNaN(x))?p.reduce((a,x)=>a*256+x,0):0; };
@@ -555,7 +595,9 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
   _renderSubtitle(all) {
     const el = this.shadowRoot.getElementById('subtitle'); if (!el) return;
     const on  = all.filter(d=>d.online).length;
-    el.innerHTML = `<span class="count-badge"><b>${on}/${all.length}</b> online</span>`;
+    const st  = all.filter(d=>d.static_lease).length;
+    el.innerHTML = `<span class="count-badge"><b>${on}/${all.filter(d=>!d.orphan).length}</b> online</span>`
+      + (st ? `<span class="count-badge"><b>${st}</b> static</span>` : '');
   }
 
   _renderTable(allArg) {
@@ -593,9 +635,10 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
               <span class="status-text ${onCls}">${statusLabel}</span>
             </div>
           </td>
-          <td><span class="mono">${d.ip||'<span class="dash">—</span>'}</span></td>
+          <td>${this._ipCell(d)}</td>
           <td>${vendor}</td>
           <td>${htBadge}</td>
+          <td>${d.persistent==null?'<span class="dash">—</span>':(d.persistent?'<span class="yes">✓</span>':'<span class="dash">✗</span>')}</td>
           <td><span class="seen-text">${relShort(d.last_seen)}</span></td>
         </tr>`;
       }).join('');
@@ -603,6 +646,18 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
     const from=rows.length?this._page*ps+1:0, to=Math.min((this._page+1)*ps,rows.length);
     pi.textContent=rows.length?`${from}–${to} of ${rows.length} device${rows.length>1?'s':''}`:'0 devices';
     prev.disabled=this._page===0; next.disabled=this._page>=maxPage;
+  }
+
+  _ipCell(d) {
+    const ip = d.ip || d.static_ip;
+    if (!ip) return '<span class="dash">—</span>';
+    if (!d.static_lease) return `<span class="mono">${ip}</span>`;
+    const mismatch = d.static_ip && d.ip && d.static_ip !== d.ip;
+    const title = mismatch
+      ? `Static lease ${d.static_ip} — current IP ${d.ip} (lease applied at next DHCP renewal)`
+      : `Static lease${d.static_comment ? ' — ' + d.static_comment : ''}`;
+    return `<span class="ip-cell" title="${esc(title)}"><span class="mono">${ip}</span>`
+      + `<ha-icon class="lease-ico${mismatch?' lease-mismatch':''}" icon="${mismatch?'mdi:lock-alert':'mdi:lock'}"></ha-icon></span>`;
   }
 
   _openPopup(mac) {
@@ -657,6 +712,25 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
         </div>
       </div>`:''}
       <div class="popup-section">
+        <div class="popup-section-title">📌 Bail DHCP statique</div>
+        <div class="popup-grid">
+          <div class="pfield"><div class="plabel">Adresse IPv4 réservée</div>
+            <input class="pedit-input" id="lease-ip" type="text" inputmode="decimal"
+              value="${esc(d.static_ip || d.ip || '')}" placeholder="192.168.1.x"></div>
+          <div class="pfield"><div class="plabel">Commentaire</div>
+            <input class="pedit-input" id="lease-comment" type="text"
+              value="${esc(d.static_comment)}" placeholder="facultatif"></div>
+          <div class="pfield full"><div class="pedit-wrap" style="justify-content:flex-end">
+            ${d.static_lease?'<button class="pedit-btn danger" id="lease-del" title="Supprimer le bail">🗑</button>':''}
+            <button class="pedit-btn" id="lease-save" title="${d.static_lease?'Mettre à jour':'Créer'} le bail">✓</button>
+          </div>
+          <div class="pedit-hint">${d.static_lease
+            ? `Bail actif : ${esc(d.static_ip)}${d.ip && d.ip!==d.static_ip ? ` — l'appareil utilise encore ${esc(d.ip)} jusqu'au prochain renouvellement DHCP` : ''}`
+            : 'Aucun bail statique — l\'IP actuelle est proposée par défaut'}${this._rangeHint()}</div>
+          <div class="pedit-err" id="lease-err"></div></div>
+        </div>
+      </div>
+      <div class="popup-section">
         <div class="popup-section-title">Réseau</div>
         <div class="popup-grid">
           ${field('IPv4',d.ip)}${field('IPv6',d.ipv6)}${field('Nb adresses IP',d.ip_count||null)}
@@ -692,6 +766,7 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
           ${field('Joignable',d.reachable!=null?(d.reachable?'✅ Oui':'❌ Non'):null)}
           ${field('Actif',d.active!=null?(d.active?'✅ Oui':'❌ Non'):null)}
           ${field('Persistant',d.persistent!=null?(d.persistent?'✅ Oui':'❌ Non'):null)}
+          ${field('Bail statique',d.static_lease?'✅ Oui':'❌ Non')}
         </div>
       </div>`;
 
@@ -731,9 +806,39 @@ class FreeboxNetworkInventoryCard extends HTMLElement {
         }
       });
     }
+
+    // Bail statique : créer / mettre à jour / supprimer
+    const errEl = r.getElementById('lease-err');
+    const runLease = async (btn, service, data) => {
+      const label = btn.textContent;
+      btn.textContent='⏳'; btn.disabled=true; errEl.textContent='';
+      try {
+        await this._hass.callService(DOMAIN, service, data);
+        btn.textContent='✅';
+        setTimeout(()=>{ if (!r.getElementById('overlay').classList.contains('hidden')) this._openPopup(mac); }, 1500);   // recharge avec l'état à jour
+      } catch(e) {
+        btn.textContent='❌'; errEl.textContent = e?.message || String(e);
+        setTimeout(()=>{btn.textContent=label;btn.disabled=false;},2000);
+      }
+    };
+    r.getElementById('lease-save')?.addEventListener('click', () => {
+      const ip=r.getElementById('lease-ip').value.trim();
+      if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) { errEl.textContent='Adresse IPv4 invalide'; return; }
+      runLease(r.getElementById('lease-save'), 'set_static_lease',
+        { mac, ip, comment: r.getElementById('lease-comment').value.trim() });
+    });
+    r.getElementById('lease-del')?.addEventListener('click', () => {
+      runLease(r.getElementById('lease-del'), 'remove_static_lease', { mac });
+    });
   }
 
-    _closePopup() { this.shadowRoot.getElementById('overlay').classList.add('hidden'); }
+  _rangeHint() {
+    const a = this._hass?.states?.[LEASES_EID]?.attributes || {};
+    return a.dhcp_range_start && a.dhcp_range_end
+      ? `<br>Plage DHCP dynamique : ${esc(a.dhcp_range_start)} → ${esc(a.dhcp_range_end)}` : '';
+  }
+
+  _closePopup() { this.shadowRoot.getElementById('overlay').classList.add('hidden'); }
   getCardSize() { return 6; }
 }
 
@@ -742,7 +847,7 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'freebox-network-inventory-card',
   name: 'Freebox Network Inventory',
-  description: 'Inventaire réseau Freebox — v2.3.0',
+  description: 'Freebox network inventory — devices, static DHCP leases',
   preview: true, version: VERSION,
 });
 console.info(
