@@ -1,5 +1,6 @@
 {
   "name": "Freebox Network Inventory Card",
+  "filename": "freebox-network-inventory-card.js",
   "content_in_root": true,
   "render_readme": true
 }
